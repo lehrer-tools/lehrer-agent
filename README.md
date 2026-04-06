@@ -34,7 +34,7 @@ Der Agent ist als [Claude Code Plugin](https://docs.anthropic.com/en/docs/claude
 
 1. [ZIP herunterladen](https://github.com/lehrer-tools/lehrer-agent/archive/refs/heads/main.zip)
 2. Claude Desktop-App öffnen → oben auf **Cowork** wechseln
-3. Plugin-Sidebar → **"+"** → **Upload** → ZIP-Datei auswählen
+3. Plugin-Sidebar → **"+"** → **Upload plugin** → ZIP-Datei auswählen
 
 **Methode 3 — Ordner öffnen:**
 
