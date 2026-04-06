@@ -1,0 +1,369 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""
+Extract books from Klett Lernen offline data.
+
+Reads the Klett Lernen app container, copies the embedded ePaper PDF,
+extracts page text from search.xml, and exports supplementary materials
+(Kopiervorlagen, Lösungen, Tafelbilder).
+
+Usage: klett [--output <dir>] [--book <dua-id>]
+             [--no-materials] [--markdown] [--force]
+"""
+
+import sys
+import os
+import re
+import shutil
+import subprocess
+import platform
+from pathlib import Path
+from xml.etree import ElementTree
+
+
+# -- Path to Klett Lernen app data --
+def find_klett_base() -> Path:
+    home = Path.home()
+
+    if sys.platform == "darwin":
+        candidates = [
+            home / "Library" / "Containers" / "de.klett.dua.schueler"
+            / "Data" / "Library" / "Application Support" / "Klett" / "klett_lernen",
+        ]
+    elif sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        candidates = [
+            local / "Klett" / "klett_lernen",
+            appdata / "Klett" / "klett_lernen",
+        ]
+        # Windows Store (UWP)
+        packages = local / "Packages"
+        if packages.exists():
+            for entry in packages.iterdir():
+                if entry.is_dir() and "klett" in entry.name.lower():
+                    for sub in ("LocalState", "LocalCache"):
+                        p = entry / sub / "Klett" / "klett_lernen"
+                        if p.exists():
+                            candidates.insert(0, p)
+    else:
+        candidates = []
+
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0] if candidates else Path("klett_lernen")
+
+
+# -- Decode hex-encoded JSON files (.dat) --
+def read_hex_json(path: Path):
+    import json
+    hex_str = path.read_text("ascii").strip()
+    raw = bytes.fromhex(hex_str)
+    return json.loads(raw.decode("utf-8"))
+
+
+# -- Find all user UUIDs --
+def find_user_dirs(base: Path) -> list[Path]:
+    dirs = []
+    for entry in base.iterdir():
+        if entry.name == "duas" or not entry.is_dir():
+            continue
+        if any(f.name.startswith("userOfflineDua") for f in entry.iterdir()):
+            dirs.append(entry)
+    return dirs
+
+
+# -- Load product catalog --
+def load_products(user_dir: Path) -> list:
+    for name in ("userOfflineDua_new.dat", "userOfflineDua.dat"):
+        p = user_dir / name
+        if p.exists():
+            try:
+                return read_hex_json(p)
+            except Exception:
+                continue
+    return []
+
+
+# -- Find DUA content directories --
+def find_duas(base: Path) -> list[dict]:
+    duas_dir = base / "duas"
+    if not duas_dir.exists():
+        return []
+
+    results = []
+    for entry in sorted(duas_dir.iterdir()):
+        if not entry.is_dir() or not entry.name.startswith("DUA-"):
+            continue
+        produkt_xml = entry / "produkt.xml"
+        if not produkt_xml.exists():
+            continue
+        results.append({"id": entry.name, "path": entry, "produkt_xml": produkt_xml})
+    return results
+
+
+# -- Parse produkt.xml --
+def parse_produkt_xml(xml_path: Path) -> dict:
+    text = xml_path.read_text("utf-8")
+    meta = {}
+    for tag in ("title", "subtitle", "productnumber", "publisher", "project_id"):
+        m = re.search(rf"<{tag}>([^<]*)</{tag}>", text)
+        meta[tag] = m.group(1).strip() if m else ""
+    return meta
+
+
+# -- Find ePaper directory --
+def find_epaper_dir(dua_path: Path) -> Path | None:
+    media_dir = dua_path / "content" / "media"
+    if not media_dir.exists():
+        return None
+    for entry in media_dir.iterdir():
+        if entry.is_dir() and (entry / "epaper.pdf").exists():
+            return entry
+    return None
+
+
+# -- Extract page texts from search.xml --
+def extract_search_text(search_xml: Path) -> list[dict]:
+    raw = search_xml.read_text("utf-8")
+    pages = []
+    for m in re.finditer(r'<page id="(\d+)">\s*<!\[CDATA\[\s*([\s\S]*?)\s*\]\]>\s*</page>', raw):
+        pages.append({"id": int(m.group(1)), "text": m.group(2).strip()})
+    pages.sort(key=lambda p: p["id"])
+    return pages
+
+
+# -- List supplementary materials --
+def list_materials(dua_path: Path, epaper_dir_name: str) -> list[dict]:
+    media_dir = dua_path / "content" / "media"
+    if not media_dir.exists():
+        return []
+
+    skip = {"material_thumbs", epaper_dir_name}
+    materials = []
+
+    def walk(d: Path, category: str):
+        if not d.exists():
+            return
+        for entry in sorted(d.iterdir()):
+            if entry.is_dir():
+                walk(entry, category)
+            else:
+                materials.append({"path": entry, "name": entry.name, "category": category})
+
+    for sub in sorted(media_dir.iterdir()):
+        if not sub.is_dir() or sub.name in skip:
+            continue
+        walk(sub, sub.name)
+
+    return materials
+
+
+# -- Convert docx to text --
+def docx_to_text(docx_path: Path) -> str | None:
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["textutil", "-convert", "txt", "-stdout", str(docx_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        elif sys.platform == "win32":
+            ps = f"""
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$doc = $word.Documents.Open('{str(docx_path).replace("'", "''")}')
+$doc.Content.Text
+$doc.Close($false)
+$word.Quit()
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+""".strip()
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                return result.stdout
+    except Exception:
+        pass
+    return None
+
+
+# -- Extract text from TBI XML --
+def parse_tbi_xml(xml_path: Path) -> str | None:
+    text = xml_path.read_text("utf-8")
+    blocks = []
+    for m in re.finditer(r"<!\[CDATA\[([\s\S]*?)\]\]>", text):
+        html = m.group(1)
+        plain = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+        plain = re.sub(r"</p>", "\n\n", plain, flags=re.I)
+        plain = re.sub(r"<[^>]+>", "", plain)
+        plain = plain.replace("&amp;", "&").replace("&lt;", "<")
+        plain = plain.replace("&gt;", ">").replace("&quot;", '"')
+        plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+        if plain:
+            blocks.append(plain)
+    return "\n\n---\n\n".join(blocks) if blocks else None
+
+
+# -- Main --
+def main():
+    args = sys.argv[1:]
+    force = "--force" in args
+    markdown = "--markdown" in args
+    no_materials = "--no-materials" in args
+    book_filter = args[args.index("--book") + 1] if "--book" in args else None
+    default_books = Path(__file__).resolve().parent / "books"
+    output_dir = Path(args[args.index("--output") + 1]).resolve() if "--output" in args else default_books
+
+    base = find_klett_base()
+
+    if not base.exists():
+        print(f"Klett Lernen Daten nicht gefunden unter: {base}", file=sys.stderr)
+        print("Ist die Klett Lernen App installiert und ein Buch heruntergeladen?", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load product catalog
+    user_dirs = find_user_dirs(base)
+    product_map = {}
+    for d in user_dirs:
+        for p in load_products(d):
+            product_map[p.get("id") or p.get("dienst_id")] = p
+
+    # Find all DUAs
+    duas = find_duas(base)
+    if not duas:
+        print("Keine heruntergeladenen Bücher gefunden.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Gefundene Bücher:")
+    for dua in duas:
+        meta = parse_produkt_xml(dua["produkt_xml"])
+        product = product_map.get(dua["id"])
+        title = (product or {}).get("titel") or meta.get("subtitle") or meta.get("title")
+        print(f"  {title} ({dua['id']})")
+
+    for dua in duas:
+        if book_filter and dua["id"] != book_filter:
+            continue
+
+        meta = parse_produkt_xml(dua["produkt_xml"])
+        product = product_map.get(dua["id"])
+        title = (product or {}).get("titel") or meta.get("subtitle") or meta.get("title") or dua["id"]
+
+        print(f"\n{title}:")
+
+        base_name = re.sub(r'[/\\:*?"<>|]', "-", title)
+        dir_name = f"{base_name} ({dua['id']})"
+        book_dir = output_dir / dir_name
+
+        ext = "md" if markdown else "txt"
+        if not force and (book_dir / f"{base_name}.{ext}").exists():
+            print("  Bereits vorhanden, überspringe. (--force zum Überschreiben)")
+            continue
+
+        book_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find ePaper directory
+        epaper_dir = find_epaper_dir(dua["path"])
+
+        if epaper_dir:
+            # Copy PDF
+            src_pdf = epaper_dir / "epaper.pdf"
+            dest_pdf = book_dir / f"{base_name}.pdf"
+            shutil.copy2(src_pdf, dest_pdf)
+            size_mb = src_pdf.stat().st_size / 1024 / 1024
+            print(f"  PDF kopiert: {size_mb:.1f} MB -> {dest_pdf}")
+
+            # Extract text from search.xml
+            search_xml = epaper_dir / "content" / "search.xml"
+            if search_xml.exists():
+                pages = extract_search_text(search_xml)
+                non_empty = [p for p in pages if p["text"]]
+                print(f"  Text extrahiert: {len(non_empty)}/{len(pages)} Seiten")
+
+                out_path = book_dir / f"{base_name}.{ext}"
+                if markdown:
+                    content = f"# {title}\n\n"
+                    for p in pages:
+                        if not p["text"]:
+                            continue
+                        content += f"## Seite {p['id']}\n\n{p['text']}\n\n"
+                else:
+                    content = ""
+                    for p in pages:
+                        content += f"--- Seite {p['id']} ---\n{p['text']}\n\n"
+
+                out_path.write_text(content, encoding="utf-8")
+                print(f"  -> {out_path}")
+            else:
+                print("  Kein search.xml gefunden — kein Volltext verfügbar.")
+        else:
+            print("  Kein ePaper-Verzeichnis gefunden.")
+
+        # Export materials
+        if not no_materials:
+            epaper_name = epaper_dir.name if epaper_dir else ""
+            materials = list_materials(dua["path"], epaper_name)
+
+            text_materials = [m for m in materials
+                             if m["name"].endswith((".docx", ".xml", ".pdf"))]
+
+            if text_materials:
+                print(f"  Materialien exportieren ({len(text_materials)} Dateien)...")
+                mat_dir = book_dir / "Zusatzmaterial"
+                mat_dir.mkdir(parents=True, exist_ok=True)
+
+                copied = 0
+                converted = 0
+
+                by_category: dict[str, list] = {}
+                for m in text_materials:
+                    by_category.setdefault(m["category"], []).append(m)
+
+                for cat, items in sorted(by_category.items()):
+                    cat_dir = mat_dir / cat
+                    cat_dir.mkdir(parents=True, exist_ok=True)
+
+                    for m in items:
+                        dest = cat_dir / m["name"]
+                        shutil.copy2(m["path"], dest)
+                        copied += 1
+
+                        if m["name"].endswith(".docx"):
+                            text = docx_to_text(m["path"])
+                            if text:
+                                (cat_dir / m["name"].replace(".docx", ".md")).write_text(text, encoding="utf-8")
+                                converted += 1
+
+                        if m["name"].endswith(".xml"):
+                            text = parse_tbi_xml(m["path"])
+                            if text:
+                                (cat_dir / m["name"].replace(".xml", ".md")).write_text(text, encoding="utf-8")
+                                converted += 1
+
+                print(f"  -> {copied} Dateien kopiert, {converted} nach Markdown konvertiert")
+
+                # Material index
+                md = f"# Zusatzmaterial — {title}\n\n"
+                md += f"Insgesamt {len(text_materials)} Dateien.\n\n"
+                for cat, items in sorted(by_category.items()):
+                    md += f"## {cat} ({len(items)})\n\n"
+                    for m in items:
+                        md += f"- {m['name']}\n"
+                    md += "\n"
+                (book_dir / "Zusatzmaterial.md").write_text(md, encoding="utf-8")
+            else:
+                print("  Kein Zusatzmaterial gefunden.")
+
+    print("\nFertig.")
+
+
+if __name__ == "__main__":
+    main()

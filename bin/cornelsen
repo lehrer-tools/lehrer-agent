@@ -1,0 +1,448 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pymupdf", "cryptography"]
+# ///
+"""
+Extract books from Cornelsen Offline Lernen data.
+
+Reads the Cornelsen app container, decrypts the embedded PDF (AES-128-CBC),
+extracts page text via PyMuPDF, and exports supplementary materials
+(HTML tips, additional PDFs).
+
+Usage: cornelsen [--output <dir>] [--book <id>]
+                 [--no-materials] [--markdown] [--force]
+"""
+
+import sys
+import os
+import re
+import json
+import struct
+import zlib
+import tempfile
+from pathlib import Path
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# -- Try to import PyMuPDF for text extraction --
+try:
+    import fitz  # PyMuPDF
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+# -- AES-128-CBC decryption (key from app source) --
+CIPHER_B64 = "YWVzLTEyOC1jYmN8RCtEeEpTRn0yQjtrLTtDfQ=="
+
+def decrypt_buffer(encrypted: bytes) -> bytes:
+    import base64
+    decoded = base64.b64decode(CIPHER_B64).decode("ascii")
+    algorithm, key_str = decoded.split("|")
+    key = key_str.encode("ascii")
+    iv = key_str[::-1].encode("ascii")
+
+    from cryptography.hazmat.primitives import padding as sym_padding
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(encrypted) + decryptor.finalize()
+
+    # Remove PKCS7 padding
+    unpadder = sym_padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+# -- Path to Cornelsen app data --
+def find_cornelsen_base() -> Path:
+    home = Path.home()
+    candidates = []
+
+    if sys.platform == "darwin":
+        candidates = [
+            Path("/Applications/CornelsenOfflineLernen.app/Contents/Resources/uma"),
+            home / "Applications" / "CornelsenOfflineLernen.app" / "Contents" / "Resources" / "uma",
+        ]
+    elif sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        prog = Path(os.environ.get("PROGRAMFILES", "C:\\Program Files"))
+        prog86 = Path(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"))
+
+        for base in (local / "Programs", prog, prog86):
+            candidates.append(base / "CornelsenOfflineLernen" / "resources" / "uma")
+            candidates.append(base / "CornelsenOfflineLernen" / "uma")
+            candidates.append(base / "Cornelsen Offline Lernen" / "resources" / "uma")
+            candidates.append(base / "Cornelsen Offline Lernen" / "uma")
+
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0] if candidates else Path("cornelsen_uma")
+
+
+# -- Pure Python ZIP reader --
+
+def read_zip_central_directory(zip_path: Path) -> tuple[list[dict], bytes]:
+    buf = zip_path.read_bytes()
+
+    # Find End of Central Directory
+    eocd_offset = -1
+    for i in range(len(buf) - 22, max(-1, len(buf) - 65557 - 1), -1):
+        if struct.unpack_from("<I", buf, i)[0] == 0x06054B50:
+            eocd_offset = i
+            break
+    if eocd_offset < 0:
+        return [], buf
+
+    cd_offset = struct.unpack_from("<I", buf, eocd_offset + 16)[0]
+    cd_size = struct.unpack_from("<I", buf, eocd_offset + 12)[0]
+
+    # ZIP64
+    if cd_offset == 0xFFFFFFFF:
+        for i in range(eocd_offset - 20, max(-1, eocd_offset - 41), -1):
+            if struct.unpack_from("<I", buf, i)[0] == 0x07064B50:
+                z64_offset = struct.unpack_from("<Q", buf, i + 8)[0]
+                if struct.unpack_from("<I", buf, z64_offset)[0] == 0x06064B50:
+                    cd_offset = struct.unpack_from("<Q", buf, z64_offset + 48)[0]
+                break
+
+    entries = []
+    pos = cd_offset
+    while pos < cd_offset + cd_size and pos + 46 <= len(buf):
+        sig = struct.unpack_from("<I", buf, pos)[0]
+        if sig != 0x02014B50:
+            break
+        method = struct.unpack_from("<H", buf, pos + 10)[0]
+        comp_size = struct.unpack_from("<I", buf, pos + 20)[0]
+        uncomp_size = struct.unpack_from("<I", buf, pos + 24)[0]
+        name_len = struct.unpack_from("<H", buf, pos + 28)[0]
+        extra_len = struct.unpack_from("<H", buf, pos + 30)[0]
+        comment_len = struct.unpack_from("<H", buf, pos + 32)[0]
+        local_offset = struct.unpack_from("<I", buf, pos + 42)[0]
+        name = buf[pos + 46: pos + 46 + name_len].decode("utf-8")
+
+        entries.append({
+            "name": name, "method": method,
+            "comp_size": comp_size, "uncomp_size": uncomp_size,
+            "local_offset": local_offset,
+        })
+        pos += 46 + name_len + extra_len + comment_len
+
+    return entries, buf
+
+
+def extract_zip_entry(buf: bytes, entry: dict) -> bytes | None:
+    pos = entry["local_offset"]
+    sig = struct.unpack_from("<I", buf, pos)[0]
+    if sig != 0x04034B50:
+        return None
+    name_len = struct.unpack_from("<H", buf, pos + 26)[0]
+    extra_len = struct.unpack_from("<H", buf, pos + 28)[0]
+    data_start = pos + 30 + name_len + extra_len
+    compressed = buf[data_start: data_start + entry["comp_size"]]
+
+    if entry["method"] == 0:
+        return compressed
+    if entry["method"] == 8:
+        return zlib.decompress(compressed, -15)
+    return None
+
+
+def unzip_file(zip_path: Path, entry_name: str) -> bytes | None:
+    try:
+        entries, buf = read_zip_central_directory(zip_path)
+        entry = next((e for e in entries if e["name"] == entry_name), None)
+        if not entry:
+            return None
+        return extract_zip_entry(buf, entry)
+    except Exception:
+        return None
+
+
+def list_zip_entries(zip_path: Path) -> list[dict]:
+    try:
+        entries, _ = read_zip_central_directory(zip_path)
+        return entries
+    except Exception:
+        return []
+
+
+# -- Find all books --
+def find_books(base_path: Path) -> list[dict]:
+    books = []
+    for entry in sorted(base_path.iterdir()):
+        if entry.name.endswith("_uma.zip"):
+            book_id = entry.name.replace("_uma.zip", "")
+            data_zip = base_path / f"{book_id}_data.zip"
+            books.append({
+                "id": book_id,
+                "uma_zip": entry,
+                "data_zip": data_zip if data_zip.exists() else None,
+            })
+    return books
+
+
+# -- Read uma.json from UMA zip --
+def read_uma_json(uma_zip: Path) -> dict | None:
+    buf = unzip_file(uma_zip, "uma.json")
+    if not buf:
+        return None
+    try:
+        return json.loads(buf.decode("utf-8"))
+    except Exception:
+        return None
+
+
+# -- Find encrypted PDF entry --
+def find_pdf_entry(uma_zip: Path) -> str | None:
+    entries = list_zip_entries(uma_zip)
+    for e in entries:
+        if e["name"].endswith("_sf.pdf") or e["name"].endswith(".pdf"):
+            return e["name"]
+    return None
+
+
+# -- Extract text via PyMuPDF --
+def extract_pdf_text(pdf_path: Path) -> list[dict] | None:
+    if not HAS_FITZ:
+        return None
+    try:
+        doc = fitz.open(str(pdf_path))
+        pages = []
+        for i in range(len(doc)):
+            page = doc[i]
+            text = page.get_text().strip()
+            pages.append({"id": i + 1, "text": text})
+        doc.close()
+        return pages
+    except Exception:
+        return None
+
+
+# -- Convert HTML to plain text --
+def html_to_text(html: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"</p>", "\n\n", text, flags=re.I)
+    text = re.sub(r"<img[^>]*>", "", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<")
+    text = text.replace("&gt;", ">").replace("&quot;", '"').replace("&nbsp;", " ")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# -- Main --
+def main():
+    args = sys.argv[1:]
+    force = "--force" in args
+    markdown = "--markdown" in args
+    no_materials = "--no-materials" in args
+    book_filter = args[args.index("--book") + 1] if "--book" in args else None
+    default_books = Path(__file__).resolve().parent / "books"
+    output_dir = Path(args[args.index("--output") + 1]).resolve() if "--output" in args else default_books
+
+    base = find_cornelsen_base()
+
+    if not base.exists():
+        print(f"Cornelsen Offline Lernen Daten nicht gefunden unter: {base}", file=sys.stderr)
+        print("Ist die Cornelsen App installiert und ein Buch heruntergeladen?", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    books = find_books(base)
+    if not books:
+        print("Keine heruntergeladenen Bücher gefunden.", file=sys.stderr)
+        sys.exit(1)
+
+    if not HAS_FITZ:
+        print("Hinweis: PyMuPDF nicht verfügbar — nur PDF wird extrahiert, kein Text.")
+        print()
+
+    # Read metadata
+    print("Gefundene Bücher:")
+    uma_cache = {}
+    for book in books:
+        uma = read_uma_json(book["uma_zip"])
+        uma_cache[book["id"]] = uma
+        print(f"  {uma.get('title', book['id']) if uma else book['id']} ({book['id']})")
+
+    for book in books:
+        if book_filter and book["id"] != book_filter:
+            continue
+
+        uma = uma_cache.get(book["id"])
+        title = uma.get("title", book["id"]) if uma else book["id"]
+        isbn = uma.get("isbnSb", "") if uma else ""
+
+        print(f"\n{title}:")
+
+        base_name = re.sub(r'[/\\:*?"<>|]', "-", title)
+        dir_name = f"{base_name} ({isbn})" if isbn else f"{base_name} ({book['id']})"
+        book_dir = output_dir / dir_name
+
+        if not force and (book_dir / f"{base_name}.pdf").exists():
+            print("  Bereits vorhanden, überspringe. (--force zum Überschreiben)")
+            continue
+
+        book_dir.mkdir(parents=True, exist_ok=True)
+
+        # Decrypt and extract PDF
+        pdf_entry = find_pdf_entry(book["uma_zip"])
+
+        if pdf_entry:
+            print("  PDF entschlüsseln...")
+            encrypted = unzip_file(book["uma_zip"], pdf_entry)
+
+            if encrypted:
+                try:
+                    decrypted = decrypt_buffer(encrypted)
+                    dest_pdf = book_dir / f"{base_name}.pdf"
+                    dest_pdf.write_bytes(decrypted)
+                    size_mb = len(decrypted) / 1024 / 1024
+                    print(f"  PDF: {size_mb:.1f} MB -> {dest_pdf}")
+
+                    if HAS_FITZ:
+                        print("  Text extrahieren...")
+                        pages = extract_pdf_text(dest_pdf)
+
+                        if pages:
+                            non_empty = [p for p in pages if p["text"]]
+                            print(f"  Text: {len(non_empty)}/{len(pages)} Seiten")
+
+                            ext = "md" if markdown else "txt"
+                            out_path = book_dir / f"{base_name}.{ext}"
+
+                            if markdown:
+                                content = f"# {title}\n\n"
+                                for p in pages:
+                                    if not p["text"]:
+                                        continue
+                                    content += f"## Seite {p['id']}\n\n{p['text']}\n\n"
+                            else:
+                                content = ""
+                                for p in pages:
+                                    content += f"--- Seite {p['id']} ---\n{p['text']}\n\n"
+
+                            out_path.write_text(content, encoding="utf-8")
+                            print(f"  -> {out_path}")
+                except Exception as e:
+                    print(f"  Entschlüsselung fehlgeschlagen: {e}", file=sys.stderr)
+        else:
+            print("  Kein PDF im UMA-Archiv gefunden.")
+
+        # Export supplementary materials
+        if not no_materials and book.get("data_zip"):
+            entries = list_zip_entries(book["data_zip"])
+            html_entries = [e for e in entries if e["name"].endswith(".html")]
+            pdf_entries = [e for e in entries if e["name"].endswith(".pdf")]
+
+            total_mat = len(html_entries) + len(pdf_entries)
+
+            if total_mat > 0:
+                print(f"  Materialien: {len(html_entries)} Tipps, {len(pdf_entries)} PDFs")
+                mat_dir = book_dir / "Zusatzmaterial"
+                mat_dir.mkdir(parents=True, exist_ok=True)
+
+                # Build asset map from uma.json
+                asset_map = {}
+                if uma and uma.get("assets"):
+                    for a in uma["assets"]:
+                        key = a.get("elvisId") or Path(a.get("fileName", "")).stem
+                        if key:
+                            asset_map[key] = a
+
+                # Extract HTML tips into single Tipps.md
+                if html_entries:
+                    try:
+                        all_entries, buf = read_zip_central_directory(book["data_zip"])
+
+                        sorted_html = sorted(html_entries, key=lambda e: (
+                            int(asset_map.get(Path(e["name"]).stem, {}).get("pageFrom", 9999) or 9999),
+                            Path(e["name"]).stem,
+                        ))
+
+                        md = f"# Tipps — {title}\n\n"
+                        md += f"{len(sorted_html)} Aufgaben-Tipps.\n\n"
+                        converted = 0
+
+                        for entry in sorted_html:
+                            zip_entry = next((e for e in all_entries if e["name"] == entry["name"]), None)
+                            if not zip_entry:
+                                continue
+                            data = extract_zip_entry(buf, zip_entry)
+                            if not data:
+                                continue
+
+                            html = data.decode("utf-8")
+                            text = html_to_text(html)
+                            if not text:
+                                continue
+
+                            elvis_id = Path(entry["name"]).stem
+                            meta = asset_map.get(elvis_id, {})
+                            page = f"Seite {meta['pageFrom']}" if meta.get("pageFrom") else ""
+                            sub = meta.get("subtitleHere", "")
+                            heading = " — ".join(filter(None, [page, sub])) or elvis_id
+
+                            md += f"## {heading}\n\n{text}\n\n---\n\n"
+                            converted += 1
+
+                        (mat_dir / "Tipps.md").write_text(md, encoding="utf-8")
+                        print(f"  -> {converted} Tipps in Tipps.md zusammengefasst")
+                    except Exception as e:
+                        print(f"  Tipp-Extraktion fehlgeschlagen: {e}", file=sys.stderr)
+
+                # Extract PDFs and convert to markdown
+                if pdf_entries and HAS_FITZ:
+                    converted = 0
+                    for entry in pdf_entries:
+                        data = unzip_file(book["data_zip"], entry["name"])
+                        if not data or data[0:1] != b"%":
+                            continue
+
+                        name = Path(entry["name"]).stem
+                        tmp_path = Path(tempfile.gettempdir()) / f"cornelsen_mat_{name}.pdf"
+                        tmp_path.write_bytes(data)
+
+                        pages = extract_pdf_text(tmp_path)
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                        if pages:
+                            non_empty = [p for p in pages if p["text"]]
+                            if non_empty:
+                                md = f"# {name}\n\n"
+                                for p in non_empty:
+                                    md += f"{p['text']}\n\n"
+                                (mat_dir / f"{name}.md").write_text(md, encoding="utf-8")
+                                converted += 1
+
+                    if converted > 0:
+                        print(f"  -> {converted} Material-PDFs nach Markdown konvertiert")
+
+                # Material index
+                if uma and uma.get("assets"):
+                    md = f"# Zusatzmaterial — {title}\n\n"
+                    md += f"Insgesamt {len(uma['assets'])} Assets.\n\n"
+
+                    by_type: dict[str, list] = {}
+                    for a in uma["assets"]:
+                        t = a.get("assetType", "sonstige")
+                        by_type.setdefault(t, []).append(a)
+
+                    for t, items in sorted(by_type.items()):
+                        md += f"## {t} ({len(items)})\n\n"
+                        for a in items:
+                            md += f"- {a.get('title') or a.get('fileName') or a.get('id')}\n"
+                        md += "\n"
+
+                    (book_dir / "Zusatzmaterial.md").write_text(md, encoding="utf-8")
+            else:
+                print("  Kein Zusatzmaterial gefunden.")
+
+    print("\nFertig.")
+
+
+if __name__ == "__main__":
+    main()

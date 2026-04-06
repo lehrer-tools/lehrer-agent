@@ -1,0 +1,898 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pymupdf", "cryptography"]
+# ///
+"""
+Decrypt BiBox 2.0 offline-synced files and create searchable PDFs.
+
+Reads the Chrome IndexedDB blob to extract the page-to-hash mapping,
+decrypts each page image (AES-256-CTR), embeds invisible text overlay
+from BiBox pageData (with full Unicode support), and combines them
+into a searchable PDF.
+
+Usage: bibox [--output <dir>] [--no-text] [--debug-text]
+             [--save-images] [--no-materials] [--book <id>]
+             [--markdown] [--force]
+"""
+
+import sys
+import os
+import re
+import json
+import struct
+import subprocess
+import tempfile
+from pathlib import Path
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# -- PyMuPDF for PDF creation + text overlay --
+import fitz  # PyMuPDF
+
+
+# -- BiBox AES-256-CTR constants (hardcoded in the Electron app) --
+BIBOX_KEY = b"helloWorldhelloWorldhelloWorld32"
+BIBOX_IV = bytes.fromhex("1234567890ab1234567890ab00000000")
+
+
+def decrypt(buf: bytes) -> bytes:
+    cipher = Cipher(algorithms.AES(BIBOX_KEY), modes.CTR(BIBOX_IV))
+    decryptor = cipher.decryptor()
+    return decryptor.update(buf) + decryptor.finalize()
+
+
+# -- Path helpers --
+def hash_to_file_path(sync_dir: Path, h: str) -> Path:
+    return sync_dir / h[:3] / h[3:6] / h[6:9] / h
+
+
+# -- Varint decoding --
+def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while pos < len(buf):
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 128:
+            break
+    return result, pos
+
+
+def decode_varint_zigzag(buf: bytes, pos: int) -> int:
+    result = 0
+    shift = 0
+    while pos < len(buf):
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 128:
+            break
+    return (result >> 1) ^ -(result & 1)
+
+
+# -- Extract page mapping from Chrome IndexedDB blob --
+def extract_page_mapping(blob_path: Path) -> list[dict]:
+    buf = blob_path.read_bytes()
+    text = buf.decode("latin-1")
+
+    url_re = re.compile(
+        r"https://static\.bibox2\.westermann\.de/bookpages/[A-Za-z0-9+/=]+/(\d+)\.png"
+    )
+    md5_re = re.compile(r"[0-9a-f]{32}")
+
+    urls = [(m.start(), m.end(), int(m.group(1))) for m in url_re.finditer(text)]
+    hashes = [(m.start(), m.group(0)) for m in md5_re.finditer(text)]
+
+    pairs = []
+    for u_start, u_end, page in urls:
+        for h_pos, h_val in hashes:
+            if u_end < h_pos < u_end + 400:
+                pairs.append({"page": page, "hash": h_val, "pos": u_start})
+                break
+
+    by_page: dict[int, list] = {}
+    for p in pairs:
+        by_page.setdefault(p["page"], []).append(p)
+
+    if not by_page:
+        return []
+
+    max_page = max(by_page.keys())
+    pages = []
+    for i in range(1, max_page + 1):
+        entries = by_page.get(i)
+        if not entries:
+            continue
+        entries.sort(key=lambda e: e["pos"])
+        pages.append({"page": i, "hash": entries[1]["hash"] if len(entries) >= 2 else entries[0]["hash"]})
+
+    return pages
+
+
+# -- Extract book titles from LevelDB --
+TITLE_MARKER = b'\x22\x05\x74\x69\x74\x6c\x65\x22'  # "\x05title"
+ID_MARKER = b'\x22\x02\x69\x64\x49'                   # "\x02idI"
+
+
+def extract_book_titles(ldb_dir: Path) -> dict[int, str]:
+    titles = {}
+
+    for f in ldb_dir.iterdir():
+        if f.suffix not in (".ldb", ".log"):
+            continue
+        buf = f.read_bytes()
+
+        idx = 0
+        while True:
+            idx = buf.find(TITLE_MARKER, idx)
+            if idx == -1:
+                break
+
+            title_start = idx + len(TITLE_MARKER)
+            title_len, str_start = read_varint(buf, title_start)
+            if title_len <= 0 or title_len > 200 or str_start + title_len > len(buf):
+                idx += 8
+                continue
+
+            title = buf[str_start: str_start + title_len].decode("utf-8", errors="replace")
+
+            # Confirm book record: pagenumI must follow
+            after = buf[str_start + title_len: str_start + title_len + 200]
+            if b"pagenumI" not in after:
+                idx += 8
+                continue
+
+            # Search backwards for idI
+            before = buf[max(0, idx - 200): idx]
+            id_pos = before.rfind(ID_MARKER)
+            if id_pos == -1:
+                idx += 8
+                continue
+
+            book_id = decode_varint_zigzag(before, id_pos + len(ID_MARKER))
+            if book_id > 0 and len(title) > 1:
+                titles.setdefault(book_id, title)
+
+            idx = str_start + title_len
+
+    return titles
+
+
+# -- Extract book ID from blob --
+def extract_book_id(blob_path: Path) -> int | None:
+    buf = blob_path.read_bytes()
+    pos = buf.find(b"bookIdI")
+    if pos == -1:
+        return None
+    return decode_varint_zigzag(buf, pos + 7)
+
+
+# -- Find all blob files with book data --
+def find_blob_files(idb_blob_dir: Path) -> list[Path]:
+    blobs = []
+    if not idb_blob_dir.exists():
+        return blobs
+
+    for f in idb_blob_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            buf = f.read_bytes()
+            text = buf.decode("latin-1")
+            if "bookIdI" in text and "static.bibox2.westermann.de" in text:
+                blobs.append(f)
+        except Exception:
+            pass
+
+    return blobs
+
+
+# -- Find all pageData JSONs --
+def find_all_page_data(sync_dir: Path, ldb_dir: Path) -> list[dict]:
+    hash_re = re.compile(rb"pageDataHash.{1,5}([0-9a-f]{32})")
+    candidates = set()
+
+    for f in ldb_dir.iterdir():
+        if f.suffix not in (".ldb", ".log"):
+            continue
+        buf = f.read_bytes()
+        for m in hash_re.finditer(buf):
+            candidates.add(m.group(1).decode("ascii"))
+
+    results = []
+    for h in candidates:
+        file_path = hash_to_file_path(sync_dir, h)
+        if not file_path.exists():
+            continue
+
+        try:
+            dec = decrypt(file_path.read_bytes())
+            text = dec.decode("utf-8")
+            if not text.startswith("{"):
+                continue
+            data = json.loads(text)
+            keys = list(data.keys())
+            if keys and data[keys[0]] and "txt" in data[keys[0]]:
+                results.append(data)
+        except Exception:
+            pass
+
+    return results
+
+
+# -- Extract supplemental material references from blob --
+def extract_materials(blob_buf: bytes) -> list[dict]:
+    title_key = b'\x22\x05\x74\x69\x74\x6c\x65\x22'
+    file_key = b'\x22\x04\x66\x69\x6c\x65\x22'
+    md5_key = b'\x63\x0c\x6d\x00\x64\x00\x35\x00\x73\x00\x75\x00\x6d\x00'
+
+    if b"materialsA" not in blob_buf:
+        return []
+
+    def read_len_str(pos: int) -> tuple[str, int]:
+        length = 0
+        shift = 0
+        while pos < len(blob_buf):
+            byte = blob_buf[pos]
+            pos += 1
+            length |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 128:
+                break
+        s = blob_buf[pos: pos + length].decode("latin-1")
+        return s, pos + length
+
+    materials = []
+    pos = blob_buf.find(b"materialsA")
+
+    while True:
+        pos = blob_buf.find(title_key, pos)
+        if pos == -1:
+            break
+        t_str, t_end = read_len_str(pos + len(title_key))
+        f_pos = blob_buf.find(file_key, t_end)
+        if f_pos == -1 or f_pos > t_end + 200:
+            pos = t_end
+            continue
+        f_str, f_end = read_len_str(f_pos + len(file_key))
+        ext = f_str.rsplit(".", 1)[-1] if "." in f_str else ""
+
+        md5sum = None
+        m_pos = blob_buf.find(md5_key, f_end)
+        if m_pos != -1 and m_pos < f_end + 4000:
+            hash_start = m_pos + len(md5_key) + 2
+            candidate = blob_buf[hash_start: hash_start + 32].decode("ascii", errors="replace")
+            if re.fullmatch(r"[0-9a-f]{32}", candidate):
+                md5sum = candidate
+
+        materials.append({"title": t_str, "file": f_str, "ext": ext, "md5sum": md5sum})
+        pos = f_end
+
+    return materials
+
+
+# -- Extract words with bounding boxes from BiBox pageData --
+def extract_words(txt: str, cds: list) -> list[dict]:
+    if not txt or not cds:
+        return []
+
+    words = []
+
+    def push_segment(text: str, start_idx: int, end_idx: int):
+        fc = cds[start_idx] if start_idx < len(cds) else None
+        lc = cds[end_idx] if end_idx < len(cds) else None
+        if not fc or not lc or (fc[0] == 0 and fc[2] == 0):
+            return
+        w = (lc[1] - fc[0]) / 1000
+        if w <= 0:
+            return
+        words.append({
+            "text": text,
+            "x": fc[0] / 1000,
+            "w": w,
+            "y": fc[2] / 1000,
+            "h": (fc[3] - fc[2]) / 1000,
+        })
+
+    seg_start = -1
+    seg_chars = ""
+
+    for i in range(len(txt) + 1):
+        ch = txt[i] if i < len(txt) else " "
+        is_space = ch in " \n\t\r"
+
+        if is_space:
+            if seg_start != -1 and seg_chars:
+                push_segment(seg_chars, seg_start, i - 1)
+            seg_start = -1
+            seg_chars = ""
+            continue
+
+        if seg_start == -1:
+            seg_start = i
+            seg_chars = ch
+        else:
+            prev_coord = cds[i - 1] if i - 1 < len(cds) else None
+            cur_coord = cds[i] if i < len(cds) else None
+            if (prev_coord and cur_coord and prev_coord[2] != 0 and cur_coord[2] != 0
+                    and abs(cur_coord[2] - prev_coord[2]) > 500):
+                if seg_chars:
+                    push_segment(seg_chars, seg_start, i - 1)
+                seg_start = i
+                seg_chars = ch
+            else:
+                seg_chars += ch
+
+    return words
+
+
+# -- Clean up BiBox OCR text artifacts --
+def clean_text(text: str) -> str:
+    text = text.replace(" . ", ". ")
+    text = text.replace(" .", ".")
+    text = text.replace(" ,", ",")
+    text = text.replace(" ;", ";")
+    text = text.replace(" :", ":")
+    text = text.replace(" ?", "?")
+    text = text.replace(" !", "!")
+    text = text.replace(" )", ")")
+    text = text.replace("( ", "(")
+    text = text.replace(". -", ".-")
+    text = text.replace(":// ", "://")
+    text = text.replace("www. ", "www.")
+    text = re.sub(r"\. de\b", ".de", text)
+    text = re.sub(r"\. com\b", ".com", text)
+    text = re.sub(r"\. org\b", ".org", text)
+    text = re.sub(r"\. net\b", ".net", text)
+    text = re.sub(r" +", " ", text)
+    return text.strip()
+
+
+# -- Format page text with structure detection --
+def format_page_text(txt: str, cds: list, *, markdown: bool = False) -> str:
+    if not txt or not cds:
+        return ""
+
+    # Build lines by y-coordinate
+    lines = []
+    line_chars = ""
+    line_y = -1
+    line_h = 0
+    line_x = 99999
+    char_count = 0
+    height_sum = 0
+
+    for i in range(len(txt)):
+        c = cds[i] if i < len(cds) else None
+        if not c or (c[0] == 0 and c[2] == 0):
+            line_chars += txt[i]
+            continue
+
+        y, h, x = c[2], c[3] - c[2], c[0]
+
+        if line_y == -1:
+            line_y, line_h, line_x = y, h, x
+            line_chars += txt[i]
+            height_sum += h
+            char_count += 1
+        elif abs(y - line_y) > 200:
+            gap = y - line_y
+            lines.append({"text": line_chars.strip(), "y": line_y, "h": line_h, "x": line_x, "gap_after": gap})
+            line_chars = txt[i]
+            line_y, line_h, line_x = y, h, x
+            height_sum += h
+            char_count += 1
+        else:
+            if x < line_x:
+                line_x = x
+            line_chars += txt[i]
+            height_sum += h
+            char_count += 1
+
+    if line_chars.strip():
+        lines.append({"text": line_chars.strip(), "y": line_y, "h": line_h, "x": line_x, "gap_after": 0})
+
+    if not lines:
+        return ""
+
+    body_h = round(height_sum / char_count) if char_count > 0 else 1452
+    para_gap = body_h * 2
+
+    # Merge continuation lines
+    i = len(lines) - 1
+    while i > 0:
+        prev = lines[i - 1]
+        cur = lines[i]
+        if prev["text"] and cur["text"]:
+            if prev["gap_after"] <= para_gap and abs(prev["h"] - cur["h"]) <= 200:
+                if re.search(r"[a-zäöüß]$", prev["text"], re.I) and re.match(r"[a-zäöüß]", cur["text"]):
+                    prev["text"] = prev["text"] + " " + cur["text"]
+                    prev["gap_after"] = cur["gap_after"]
+                    lines.pop(i)
+        i -= 1
+
+    # Build output
+    parts = []
+    for i, line in enumerate(lines):
+        if not line["text"]:
+            continue
+
+        is_para = i > 0 and lines[i - 1]["gap_after"] > para_gap
+        if is_para and parts:
+            parts.append("")
+
+        cleaned = clean_text(line["text"])
+        if not cleaned:
+            continue
+
+        if not markdown:
+            parts.append(cleaned)
+            continue
+
+        # List detection
+        if re.match(r"^[»›]\s*$", cleaned):
+            bullet_text = ""
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if not nxt["text"]:
+                    j += 1
+                    continue
+                nc = clean_text(nxt["text"])
+                if not nc:
+                    j += 1
+                    continue
+                if re.match(r"^[»›•·]", nc) or nxt["h"] > body_h * 1.35:
+                    break
+                bullet_text += (" " if bullet_text else "") + nc
+                if nxt["gap_after"] > para_gap:
+                    j += 1
+                    break
+                j += 1
+            # Skip processed lines (modify i via lines index)
+            if bullet_text:
+                parts.append(f"- {bullet_text}")
+            continue
+        if re.match(r"^[»›]\s+", cleaned):
+            parts.append(f"- {re.sub(r'^[»›]\\s*', '', cleaned)}")
+            continue
+        if re.match(r"^[•·]\s*", cleaned):
+            parts.append(f"- {re.sub(r'^[•·]\\s*', '', cleaned)}")
+            continue
+        if re.match(r"^[a-z]\)\s", cleaned):
+            parts.append(f"  - {cleaned}")
+            continue
+        if re.match(r"^\(\s*\d+\s*\)\s", cleaned):
+            parts.append(f"    - {cleaned}")
+            continue
+
+        # Skip standalone page numbers
+        if re.match(r"^\d{1,3}$", cleaned):
+            continue
+
+        # Heading detection by character height
+        if line["h"] > body_h * 1.7:
+            parts.append(f"## {cleaned}")
+            continue
+        if line["h"] > body_h * 1.35:
+            parts.append(f"### {cleaned}")
+            continue
+        if line["h"] > body_h * 1.2:
+            parts.append(f"#### {cleaned}")
+            continue
+
+        # TOC-like entry
+        toc_m = re.match(r"^(.+?)\s+(\d{1,3})$", cleaned)
+        if toc_m and len(cleaned) < 80:
+            parts.append(f"- {toc_m.group(1)} — {toc_m.group(2)}")
+            continue
+
+        parts.append(cleaned)
+
+    return "\n".join(parts)
+
+
+# -- Find LibreOffice --
+_soffice_cache = None
+
+def find_soffice() -> str | None:
+    global _soffice_cache
+    if _soffice_cache is not None:
+        return _soffice_cache or None
+
+    candidates = []
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]
+    elif sys.platform == "darwin":
+        candidates = ["/Applications/LibreOffice.app/Contents/MacOS/soffice"]
+    else:
+        candidates = ["/usr/bin/soffice"]
+
+    for p in candidates:
+        if Path(p).exists():
+            _soffice_cache = p
+            return p
+
+    import shutil as _shutil
+    if _shutil.which("soffice"):
+        _soffice_cache = "soffice"
+        return "soffice"
+
+    _soffice_cache = ""
+    return None
+
+
+# -- Convert buffer to text --
+def buffer_to_text(buf: bytes, ext: str, tmp_dir: Path) -> str | None:
+    tmp_path = tmp_dir / f"_convert.{ext}"
+    try:
+        tmp_path.write_bytes(buf)
+        if ext in ("doc", "docx", "rtf"):
+            if sys.platform == "darwin":
+                try:
+                    result = subprocess.run(
+                        ["textutil", "-convert", "txt", "-stdout", str(tmp_path)],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode == 0:
+                        return result.stdout
+                except Exception:
+                    pass
+            soffice = find_soffice()
+            if soffice:
+                try:
+                    subprocess.run(
+                        [soffice, "--headless", "--convert-to", "txt:Text",
+                         "--outdir", str(tmp_dir), str(tmp_path)],
+                        capture_output=True, timeout=30,
+                    )
+                    txt_path = tmp_path.with_suffix(".txt")
+                    if txt_path.exists():
+                        text = txt_path.read_text("utf-8")
+                        txt_path.unlink(missing_ok=True)
+                        return text
+                except Exception:
+                    pass
+        if ext == "pdf":
+            # Use PyMuPDF
+            try:
+                doc = fitz.open(str(tmp_path))
+                text = ""
+                for page in doc:
+                    text += page.get_text() + "\n"
+                doc.close()
+                return text
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return None
+
+
+# -- Convert material to markdown --
+def convert_to_markdown(buf: bytes, file_name: str, out_dir: Path) -> bool:
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    text = buffer_to_text(buf, ext, out_dir)
+    if not text:
+        return False
+    md_name = re.sub(r"\.[^.]+$", ".md", file_name)
+    (out_dir / md_name).write_text(text, encoding="utf-8")
+    return True
+
+
+# -- Find a Unicode font for text overlay --
+def find_unicode_font() -> str | None:
+    if sys.platform == "win32":
+        fonts = Path("C:\\Windows\\Fonts")
+        candidates = [fonts / "arialuni.ttf", fonts / "arial.ttf", fonts / "segoeui.ttf"]
+    else:
+        candidates = [
+            Path("/Library/Fonts/Arial Unicode.ttf"),
+            Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            Path("/System/Library/Fonts/Helvetica.ttc"),
+        ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+# -- Main --
+def main():
+    args = sys.argv[1:]
+    force = "--force" in args
+    no_text = "--no-text" in args
+    markdown = "--markdown" in args
+    debug_text = "--debug-text" in args
+    save_images = "--save-images" in args
+    no_materials = "--no-materials" in args
+    save_materials = not no_materials
+    book_filter = int(args[args.index("--book") + 1]) if "--book" in args else None
+    default_books = Path(__file__).resolve().parent / "books"
+    output_dir = Path(args[args.index("--output") + 1]).resolve() if "--output" in args else default_books
+
+    home = Path.home()
+    if sys.platform == "win32":
+        appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        bibox_data = appdata / "BiBox 2.0"
+    else:
+        bibox_data = home / "Library" / "Application Support" / "BiBox 2.0"
+
+    sync_dir = bibox_data / "synchronizedFiles"
+    idb_blob_dir = bibox_data / "IndexedDB" / "app_angular_0.indexeddb.blob"
+    ldb_dir = bibox_data / "IndexedDB" / "app_angular_0.indexeddb.leveldb"
+
+    if not sync_dir.exists():
+        print(f"BiBox synchronizedFiles nicht gefunden unter: {sync_dir}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"BiBox-Daten: {bibox_data}", flush=True)
+    print(f"Suche IndexedDB Blobs...", flush=True)
+    blob_files = find_blob_files(idb_blob_dir)
+    if not blob_files:
+        print("Keine IndexedDB Blobs mit Buchdaten gefunden.", file=sys.stderr, flush=True)
+        sys.exit(1)
+    print(f"  {len(blob_files)} Blob(s) gefunden.", flush=True)
+
+    # Load all page text data
+    print("Lade Text-Daten...", flush=True)
+    all_page_data = find_all_page_data(sync_dir, ldb_dir)
+    if all_page_data:
+        for pd in all_page_data:
+            ids = list(pd.keys())
+            with_text = sum(1 for k in ids if pd[k].get("txt"))
+            print(f"  Text-Daten gefunden: {with_text}/{len(ids)} Seiten.", flush=True)
+    else:
+        print("  Keine Text-Daten gefunden. PDF wird nicht durchsuchbar.", flush=True)
+
+    # Find font
+    font_path = None
+    if not no_text and all_page_data:
+        font_path = find_unicode_font()
+        if font_path:
+            print(f"  Font: {font_path}", flush=True)
+        else:
+            print("  Warnung: Kein Unicode-Font gefunden. Einige Zeichen könnten fehlen.", flush=True)
+
+    # Extract book titles
+    book_titles = extract_book_titles(ldb_dir)
+
+    print("\nGefundene Bücher:", flush=True)
+    for blob_path in blob_files:
+        bid = extract_book_id(blob_path)
+        title = book_titles.get(bid, f"Book {bid}")
+        print(f"  {title} (ID {bid})", flush=True)
+
+    for blob_path in blob_files:
+        book_id = extract_book_id(blob_path)
+        if book_filter and book_id != book_filter:
+            continue
+
+        book_title = book_titles.get(book_id)
+        book_label = f"{book_title} ({book_id})" if book_title else f"Book {book_id}"
+        pages = extract_page_mapping(blob_path)
+
+        if not pages:
+            print(f"\n{book_label}: keine Seiten gefunden, überspringe.", flush=True)
+            continue
+
+        existing = [p for p in pages if hash_to_file_path(sync_dir, p["hash"]).exists()]
+        print(f"\n{book_label}: {len(pages)} Seiten, {len(existing)} lokal verfügbar", flush=True)
+
+        if not existing:
+            print("  Keine lokalen Dateien, überspringe.", flush=True)
+            continue
+
+        # Match pageData by page count
+        page_data_map = None
+        sorted_page_ids = None
+        if all_page_data:
+            best = min(all_page_data, key=lambda pd: abs(len(pd) - len(pages)))
+            sorted_ids = sorted(int(k) for k in best.keys())
+            if abs(len(sorted_ids) - len(pages)) <= len(pages) * 0.2:
+                page_data_map = best
+                sorted_page_ids = sorted_ids
+
+        # Output directory
+        base_name = re.sub(r'[/\\:*?"<>|]', "-", book_title) if book_title else f"book-{book_id}"
+        dir_name = f"{base_name} ({book_id})" if book_title else base_name
+        book_dir = output_dir / dir_name
+        pdf_path = book_dir / f"{base_name}.pdf"
+
+        if not force and pdf_path.exists():
+            print("  Bereits vorhanden, überspringe. (--force zum Überschreiben)", flush=True)
+            continue
+
+        book_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build PDF with PyMuPDF
+        overlay_mode = "nur Bilder" if no_text else "mit Text-Overlay"
+        print(f"  PDF erstellen ({overlay_mode})...", flush=True)
+
+        pdf_doc = fitz.open()
+        count = 0
+
+        # Load font ONCE for all pages
+        overlay_font = None
+        if not no_text and font_path:
+            try:
+                overlay_font = fitz.Font(fontfile=font_path)
+            except Exception as e:
+                print(f"  Font laden fehlgeschlagen: {e}", flush=True)
+
+        overlay_color = (1, 0, 0) if debug_text else (0, 0, 0)
+        overlay_opacity = 0.5 if debug_text else 0
+
+        for p in pages:
+            file_path = hash_to_file_path(sync_dir, p["hash"])
+            if not file_path.exists():
+                continue
+
+            encrypted = file_path.read_bytes()
+            decrypted = decrypt(encrypted)
+
+            # Detect image format
+            if decrypted[:2] == b"\xff\xd8":
+                ext = "jpg"
+            elif decrypted[:2] == b"\x89\x50":
+                ext = "png"
+            else:
+                continue
+
+            # Save individual image
+            if save_images:
+                img_dir = book_dir / "images"
+                img_dir.mkdir(parents=True, exist_ok=True)
+                (img_dir / f"page-{p['page']:04d}.{ext}").write_bytes(decrypted)
+
+            try:
+                # Create page from image
+                img = fitz.open(stream=decrypted, filetype=ext)
+                img_page = img[0]
+                rect = img_page.rect
+                pdf_page = pdf_doc.new_page(width=rect.width, height=rect.height)
+                pdf_page.insert_image(rect, stream=decrypted)
+                img.close()
+
+                # Add text overlay (one TextWriter per page, font reused)
+                if overlay_font and sorted_page_ids and 1 <= p["page"] <= len(sorted_page_ids):
+                    page_id = sorted_page_ids[p["page"] - 1]
+                    pd = page_data_map.get(str(page_id))
+                    if pd and pd.get("txt") and pd.get("cds"):
+                        words = extract_words(pd["txt"], pd["cds"])
+                        tw = fitz.TextWriter(pdf_page.rect)
+                        appended = 0
+                        for w in words:
+                            x = (w["x"] / 100) * rect.width
+                            y = (w["y"] / 100) * rect.height
+                            target_w = (w["w"] / 100) * rect.width
+                            target_h = (w["h"] / 100) * rect.height
+
+                            # Calculate font size from target width (like JS version)
+                            width_at_1 = overlay_font.text_length(w["text"], fontsize=1)
+                            if width_at_1 <= 0:
+                                continue
+                            font_size = min(target_w / width_at_1, target_h)
+                            if font_size < 0.5:
+                                continue
+
+                            try:
+                                tw.append(fitz.Point(x, y + target_h), w["text"],
+                                         fontsize=font_size, font=overlay_font)
+                                appended += 1
+                            except Exception:
+                                pass
+                        if appended:
+                            tw.write_text(pdf_page, color=overlay_color, opacity=overlay_opacity)
+
+                count += 1
+                if count % 50 == 0:
+                    print(f"  {count}/{len(existing)} Seiten...", end="\r", flush=True)
+            except Exception as e:
+                print(f"  Seite {p['page']}: Fehler: {e}", flush=True)
+                continue
+
+        print(f"  PDF speichern...", end="", flush=True)
+        pdf_doc.save(str(pdf_path), garbage=4, deflate=True)
+        size_mb = pdf_path.stat().st_size / 1024 / 1024
+        pdf_doc.close()
+        print(f" {count} Seiten, {size_mb:.1f} MB -> {pdf_path}", flush=True)
+
+        # Export text
+        if sorted_page_ids and page_data_map:
+            ext = "md" if markdown else "txt"
+            print(f"  Text exportieren ({ext})...", flush=True)
+            content = ""
+
+            for p in pages:
+                page_id = sorted_page_ids[p["page"] - 1] if 1 <= p["page"] <= len(sorted_page_ids) else None
+                pd = page_data_map.get(str(page_id)) if page_id is not None else None
+
+                if markdown:
+                    content += (format_page_text(pd["txt"], pd["cds"], markdown=True) if pd and pd.get("txt") else "") + "\n\n"
+                else:
+                    content += (pd.get("txt", "") if pd else "") + "\n\n"
+
+            out_path = book_dir / f"{base_name}.{ext}"
+            out_path.write_text(content, encoding="utf-8")
+            print(f"  -> {out_path}", flush=True)
+
+        # Export materials
+        print("  Zusatzmaterial-Referenz erstellen...", flush=True)
+        blob_buf = blob_path.read_bytes()
+        materials = extract_materials(blob_buf)
+
+        if materials:
+            seen = {}
+            unique = []
+            for m in materials:
+                key = m["title"] + m["file"]
+                if key not in seen:
+                    seen[key] = True
+                    unique.append(m)
+
+            by_ext: dict[str, list] = {}
+            for m in unique:
+                by_ext.setdefault(m["ext"], []).append(m)
+
+            md = f"# Zusatzmaterial — {book_title or f'Book {book_id}'}\n\n"
+            md += f"Insgesamt {len(unique)} Dateien.\n\n"
+            for ext_name, items in sorted(by_ext.items()):
+                md += f"## {ext_name.upper()} ({len(items)})\n\n"
+                for m in items:
+                    md += f"- {m['title']} — `{m['file']}`\n"
+                md += "\n"
+
+            (book_dir / "Zusatzmaterial.md").write_text(md, encoding="utf-8")
+            print(f"  -> {book_dir / 'Zusatzmaterial.md'} ({len(unique)} Einträge)", flush=True)
+
+            # Download and convert materials
+            if save_materials and any(m["md5sum"] for m in unique):
+                mat_dir = book_dir / "Zusatzmaterial"
+                mat_dir.mkdir(parents=True, exist_ok=True)
+                saved = 0
+                converted = 0
+                skipped = 0
+
+                for m in unique:
+                    if not m["md5sum"]:
+                        skipped += 1
+                        continue
+                    file_path = hash_to_file_path(sync_dir, m["md5sum"])
+                    if not file_path.exists():
+                        skipped += 1
+                        continue
+
+                    decrypted = decrypt(file_path.read_bytes())
+                    out_name = re.sub(r'[/\\:*?"<>|]', "-", m["file"])
+
+                    (mat_dir / out_name).write_bytes(decrypted)
+                    saved += 1
+
+                    if convert_to_markdown(decrypted, out_name, mat_dir):
+                        converted += 1
+
+                print(f"  Materialien gespeichert: {saved} Dateien -> {mat_dir}", flush=True)
+                if converted:
+                    print(f"  Materialien konvertiert: {converted} Markdown-Dateien", flush=True)
+                if skipped:
+                    print(f"  {skipped} übersprungen (kein Hash oder nicht lokal)", flush=True)
+        else:
+            print("  Kein Zusatzmaterial gefunden.", flush=True)
+
+    print("\nFertig.", flush=True)
+
+
+if __name__ == "__main__":
+    main()

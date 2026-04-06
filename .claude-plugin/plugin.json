@@ -1,0 +1,31 @@
+{
+  "name": "lehrer-agent",
+  "version": "0.1.0",
+  "description": "Lehrassistent für Lehrkräfte -- Unterricht planen, Tests erstellen, Material sammeln, Verwaltungsvorschriften nachschlagen. Alle Ausgaben als .docx (Word).",
+  "author": {
+    "name": "anonym"
+  },
+  "license": "MIT",
+  "keywords": ["education", "teacher", "schule", "unterricht", "sekundarstufe"],
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "bundesland": {
+      "title": "Bundesland",
+      "description": "Bundesland der Schule (Default: Berlin)",
+      "type": "string",
+      "sensitive": false
+    },
+    "schultyp": {
+      "title": "Schultyp",
+      "description": "Schultyp, z.B. Förderschule, Oberschule, Gesamtschule, Gymnasium",
+      "type": "string",
+      "sensitive": false
+    },
+    "schulstufe": {
+      "title": "Schulstufe",
+      "description": "Schulstufe, z.B. Sekundarstufe I, Sekundarstufe II, Primarstufe",
+      "type": "string",
+      "sensitive": false
+    }
+  }
+}

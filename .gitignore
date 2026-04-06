@@ -1,0 +1,21 @@
+# Urheberrechtlich geschütztes Lehrmaterial
+books/
+
+# Dependencies
+node_modules/
+
+# Secrets
+.env
+
+# Persönliche Daten
+config/lehrer.md
+
+# Playwright Cache
+.playwright-mcp/
+
+# Andere KI-Konfigurationen
+gemini.md
+
+# OS
+.DS_Store
+__pycache__/
