@@ -47,9 +47,9 @@ Skills per Chat aufrufen:
 ### Claude Code (CLI / IDE)
 
 ```bash
-# Plugin aus GitHub installieren
-claude plugin marketplace add lehrer-tools/lehrer-agent
-claude plugin install lehrer-agent@lehrer-agent
+# Plugin aus Marketplace installieren
+claude plugin marketplace add lehrer-tools/marketplace
+claude plugin install lehrer-agent
 
 # Oder: Repo klonen und direkt nutzen
 git clone https://github.com/lehrer-tools/lehrer-agent.git
